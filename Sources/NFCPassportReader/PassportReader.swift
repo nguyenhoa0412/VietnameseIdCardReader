@@ -35,6 +35,11 @@ public class PassportReader : NSObject {
     private var paceHandler : PACEHandler?
     private var canKey : String = ""
     private var dataAmountToReadOverride : Int? = nil
+
+    // Challenge cho Active Authentication do phía ngoài (backend) cung cấp.
+    // Nếu nil thì tự sinh ngẫu nhiên như mặc định. Dùng cho luồng đăng nhập
+    // chống replay: backend sinh challenge, chip ký, backend verify.
+    private var externalActiveAuthChallenge : [UInt8]? = nil
     
     private var scanCompletedHandler: ((NFCPassportModel?, NFCPassportReaderError?)->())!
     private var nfcViewDisplayMessageHandler: ((NFCViewDisplayMessage) -> String?)?
@@ -63,13 +68,16 @@ public class PassportReader : NSObject {
         dataAmountToReadOverride = amount
     }
     
-    public func readPassport( canKey : String, tags : [DataGroupId] = [], skipSecureElements : Bool = true, skipCA : Bool = false, skipPACE : Bool = false, useExtendedMode : Bool = false, customDisplayMessage : ((NFCViewDisplayMessage) -> String?)? = nil) async throws -> NFCPassportModel {
+    public func readPassport( canKey : String, tags : [DataGroupId] = [], skipSecureElements : Bool = true, skipCA : Bool = false, skipPACE : Bool = false, useExtendedMode : Bool = false, activeAuthChallenge : [UInt8]? = nil, customDisplayMessage : ((NFCViewDisplayMessage) -> String?)? = nil) async throws -> NFCPassportModel {
         
         self.passport = NFCPassportModel()
         self.canKey = canKey
         self.skipCA = skipCA
         self.skipPACE = skipPACE
         self.useExtendedMode = useExtendedMode
+        // Nếu truyền challenge từ ngoài (backend) thì Active Authentication sẽ dùng nó
+        // để chống replay; nil = tự sinh ngẫu nhiên như mặc định.
+        self.externalActiveAuthChallenge = activeAuthChallenge
         
         self.dataGroupsToRead.removeAll()
         self.dataGroupsToRead.append( contentsOf:tags)
@@ -104,6 +112,36 @@ public class PassportReader : NSObject {
         return try await withCheckedThrowingContinuation({ (continuation: NFCCheckedContinuation) in
             self.nfcContinuation = continuation
         })
+    }
+
+    /// Đọc thẻ phục vụ ĐĂNG NHẬP bằng Active Authentication chống replay.
+    ///
+    /// Backend sinh `challenge` (8 byte), truyền vào đây. Hàm thiết lập PACE bằng
+    /// `canKey`, đọc các data group cần cho passive auth (mặc định DG15 + SOD),
+    /// rồi cho chip ký `challenge` qua INTERNAL AUTHENTICATE.
+    ///
+    /// Kết quả nằm trong `NFCPassportModel` trả về:
+    /// - `activeAuthenticationSignature`: chữ ký chip tạo cho challenge (gửi lên backend verify).
+    /// - `activeAuthenticationChallenge`: chính challenge đã dùng (để đối chiếu).
+    /// - `dataGroupsRead[.DG15]?.data`, `dataGroupsRead[.SOD]?.data`: dữ liệu thô cho passive auth.
+    /// - `activeAuthenticationSupported` / `activeAuthenticationPassed`: cờ tiện lợi (client tham khảo).
+    ///
+    /// Lưu ý: backend là nơi verify cuối cùng (passive auth + verify chữ ký bằng public key
+    /// trong DG15 đã được passive-auth). Cờ `activeAuthenticationPassed` chỉ để client phản hồi UX.
+    public func readForActiveAuth(
+        canKey: String,
+        challenge: [UInt8],
+        tags: [DataGroupId] = [.COM, .SOD, .DG15],
+        customDisplayMessage: ((NFCViewDisplayMessage) -> String?)? = nil
+    ) async throws -> NFCPassportModel {
+        return try await readPassport(
+            canKey: canKey,
+            tags: tags,
+            skipCA: true,
+            useExtendedMode: false,
+            activeAuthChallenge: challenge,
+            customDisplayMessage: customDisplayMessage
+        )
     }
 }
 
@@ -266,8 +304,9 @@ extension PassportReader {
 
         Logger.passportReader.info( "Performing Active Authentication" )
 
-        let challenge = generateRandomUInt8Array(8)
-        Logger.passportReader.debug( "Generated Active Authentication challange - \(binToHexRep(challenge))")
+        // Ưu tiên dùng challenge từ ngoài (backend) nếu có, để chống replay.
+        let challenge = self.externalActiveAuthChallenge ?? generateRandomUInt8Array(8)
+        Logger.passportReader.debug( "Active Authentication challange - \(binToHexRep(challenge))")
         let response = try await tagReader.doInternalAuthentication(challenge: challenge, useExtendedMode: useExtendedMode)
         self.passport.verifyActiveAuthentication( challenge:challenge, signature:response.data )
     }
